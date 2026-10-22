@@ -110,8 +110,11 @@ _WARMUP = []
 
 def _warm_up_work():
     t0 = time.time()
-    embed(["aquecimento"])
-    print(f"modelo de pesquisa pronto ({time.time() - t0:.1f} s)", flush=True)
+    try:
+        embed(["aquecimento"])
+        print(f"modelo de pesquisa pronto ({time.time() - t0:.1f} s)", flush=True)
+    except Exception as e:     # a pesquisa nos documentos dará erro, mas o resto da aplicação continua a funcionar
+        print(f"não foi possível carregar o modelo de pesquisa: {type(e).__name__}: {e}", flush=True)
     try:                                   # instala já a extensão de pesquisa por palavras-chave (descarga única)
         import duckdb
         duckdb.connect().execute("INSTALL fts")

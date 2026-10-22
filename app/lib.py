@@ -38,13 +38,17 @@ def db_source():
     env = os.environ.get("PROCUREMENT_DB")
     if env:
         return env
-    repo = _secret("GITHUB_DATA_REPO")
+    repo = _secret("GITHUB_DATA_REPO") or _secret("GITHUB_REPO")      # os dois nomes funcionam
     if repo:
+        repo = repo.strip().removeprefix("https://github.com/").strip("/")
         return f"github-release://{repo}"
     for candidate in [APP_DIR / "data" / "procurement.duckdb", APP_DIR.parent / "data" / "procurement.duckdb"]:
         if candidate.exists():
             return str(candidate)
     return None
+
+
+DB_PROBLEM = []      # porque é que a base de dados não foi encontrada (mostrado na página de erro)
 
 
 def _github_release_db(repo, tmp):
@@ -53,12 +57,26 @@ def _github_release_db(repo, tmp):
     token = _secret("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    DB_PROBLEM.clear()
     r = requests.get(f"https://api.github.com/repos/{repo}/releases/tags/{RELEASE_TAG}", headers=headers, timeout=30)
+    if r.status_code in (401, 403):
+        DB_PROBLEM.append(f"O GitHub recusou o token (HTTP {r.status_code}). Verifique o secret GITHUB_TOKEN: tem de dar "
+                          f"acesso ao repositório {repo} com a permissão Contents (Read-only chega) e não pode ter expirado.")
+        return None, None
     if r.status_code == 404:
+        repo_ok = requests.get(f"https://api.github.com/repos/{repo}", headers=headers, timeout=30).status_code == 200
+        DB_PROBLEM.append(
+            f"O repositório {repo} existe, mas ainda não tem a release '{RELEASE_TAG}' com a base de dados. "
+            "Corra a secção 3 do notebook 04 até ao fim ('base de dados publicada')." if repo_ok else
+            f"Não encontro o repositório '{repo}'. Confirme o nome (formato utilizador/repositório) no secret "
+            "GITHUB_DATA_REPO e que o GITHUB_TOKEN tem acesso a esse repositório (num repositório privado, "
+            "sem token o GitHub responde como se não existisse).")
         return None, None
     r.raise_for_status()
     asset = next((a for a in r.json().get("assets", []) if a["name"] == DB_ASSET), None)
     if asset is None:
+        DB_PROBLEM.append(f"A release '{RELEASE_TAG}' existe mas não tem o ficheiro {DB_ASSET}. "
+                          "Corra outra vez a secção 3 do notebook 04.")
         return None, None
     updated = pd.Timestamp(asset["updated_at"])
     local = tmp / f"procurement_gh_{asset['id']}.duckdb"
@@ -81,18 +99,32 @@ def _github_release_db(repo, tmp):
     return str(local), updated
 
 
-@st.cache_resource(ttl=600, show_spinner="A obter a base de dados...")
+class _NotFound(Exception):
+    pass
+
+
 def db_snapshot():
-    """Devolve (caminho da cópia local, data da última atualização). Verifica se há versão nova a cada 10 minutos."""
-    src = db_source()
-    if not src:
+    """Devolve (caminho da cópia local, data da última atualização), ou (None, None) se não houver base de dados.
+    Só os sucessos ficam em cache (10 minutos): depois de corrigir um problema, basta recarregar a página."""
+    try:
+        return _db_snapshot_cached(db_source())
+    except _NotFound:
         return None, None
+
+
+@st.cache_resource(ttl=600, show_spinner="A obter a base de dados...")
+def _db_snapshot_cached(src):
+    if not src:
+        raise _NotFound()
     tmp = Path(tempfile.gettempdir())
     if src.startswith("github-release://"):
-        return _github_release_db(src[len("github-release://"):], tmp)
+        result = _github_release_db(src[len("github-release://"):], tmp)
+        if result[0] is None:
+            raise _NotFound()
+        return result
     path = Path(src)
     if not path.exists():
-        return None, None
+        raise _NotFound()
     stat = path.stat()
     local = tmp / f"procurement_{int(stat.st_mtime)}_{stat.st_size}.duckdb"
     if not local.exists():
@@ -128,8 +160,14 @@ def has_table(name):
 def require_db():
     path, _ = db_snapshot()
     if path is None:
-        st.error("Base de dados não encontrada. Corra os notebooks 01 e 02 (e, para o Streamlit Cloud, a secção 3 do "
-                 "notebook 04), ou defina PROCUREMENT_DB / GITHUB_DATA_REPO.")
+        if DB_PROBLEM:
+            st.error("Base de dados não encontrada. " + DB_PROBLEM[0])
+        elif db_source() is None:
+            st.error("Base de dados não encontrada: falta o secret GITHUB_DATA_REPO (Streamlit Cloud: Settings → Secrets), "
+                     "ou corra os notebooks 01 e 02 / defina PROCUREMENT_DB.")
+        else:
+            st.error(f"Base de dados não encontrada em {db_source()}. Corra os notebooks 01 e 02.")
+        st.caption("Depois de corrigir, recarregue a página.")
         st.stop()
 
 
