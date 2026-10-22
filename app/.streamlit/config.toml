@@ -1,0 +1,14 @@
+[theme]
+base = "light"
+primaryColor = "#1f6feb"
+
+[server]
+headless = true
+# não vigiar ficheiros: evita problemas conhecidos entre o Streamlit e o torch
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "viewer"

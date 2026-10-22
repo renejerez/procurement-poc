@@ -1,0 +1,12 @@
+# PyTorch só para CPU (o Streamlit Cloud não tem GPU; a versão normal descarrega vários GB a mais)
+--extra-index-url https://download.pytorch.org/whl/cpu
+streamlit>=1.40
+duckdb>=1.1
+pandas>=2.2
+numpy
+plotly>=5.20
+networkx>=3.2
+google-genai>=1.50
+requests>=2.31
+torch
+sentence-transformers>=3.0
