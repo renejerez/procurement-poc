@@ -308,7 +308,7 @@ def _client(key):
     return genai.Client(api_key=key, http_options=types.HttpOptions(
         timeout=45_000,                                                     # 45 s por pedido
         retry_options=types.HttpRetryOptions(attempts=2, initial_delay=2.0, max_delay=10.0,
-                                             http_status_codes=[429, 500, 502, 503, 504])))
+                                             http_status_codes=[500, 502, 503, 504])))   # 429 = quota: mudar de modelo, não insistir
 
 
 def models_to_try():
@@ -338,6 +338,16 @@ def _overloaded(e):
         or "overloaded" in text.lower()
 
 
+def _quota(e):
+    """Limite do plano gratuito (429). Cada modelo tem a sua própria quota, por isso vale a pena mudar de modelo."""
+    text = str(e)
+    return "429" in text or "RESOURCE_EXHAUSTED" in text
+
+
+def _switch_model(e):
+    return _overloaded(e) or _quota(e)
+
+
 def send(message):
     """Envia a mensagem na conversa da sessão. Se o modelo estiver sobrecarregado, passa ao seguinte."""
     models = models_to_try()
@@ -359,8 +369,9 @@ def send(message):
                         "Tente reformular a pergunta de forma mais concreta, ou escolha um contrato em foco.")
             return text
         except Exception as e:
-            if _overloaded(e) and i + 1 < len(models):
-                _say(f"⚠️ {model} não respondeu a tempo ou está sobrecarregado; a tentar {models[i + 1]}")
+            if _switch_model(e) and i + 1 < len(models):
+                reason = "atingiu o limite do plano gratuito" if _quota(e) else "não respondeu a tempo ou está sobrecarregado"
+                _say(f"⚠️ {model} {reason}; a tentar {models[i + 1]}")
                 continue
             raise
 
@@ -370,8 +381,12 @@ def friendly_error(e):
     if _overloaded(e):
         return ("Os modelos do Gemini estão sobrecarregados ou lentos neste momento (erro 503/504 da Google). "
                 "Tente daqui a alguns minutos.")
-    if "429" in text or "RESOURCE_EXHAUSTED" in text:
-        return "Foi atingido o limite de pedidos do plano gratuito do Gemini. Aguarde um minuto e tente de novo."
+    if _quota(e):
+        if "PerDay" in text or "per day" in text.lower():
+            return ("Foi atingido o limite diário do plano gratuito do Gemini em todos os modelos disponíveis. "
+                    "O limite renova-se à meia-noite da Califórnia (por volta das 8h em Portugal).")
+        return ("Foi atingido o limite de pedidos por minuto do plano gratuito do Gemini em todos os modelos disponíveis. "
+                "Aguarde um minuto e tente de novo.")
     if "API_KEY" in text.upper() or "401" in text or "403" in text:
         return "A chave da API do Gemini não é válida ou não tem acesso a este modelo."
     if "timeout" in text.lower() or "timed out" in text.lower():
