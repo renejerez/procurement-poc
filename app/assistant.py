@@ -78,8 +78,11 @@ def _say(text):
             pass
 
 
-def _trace(tool, args, summary):
-    st.session_state.setdefault("trace", []).append({"ferramenta": tool, "argumentos": args, "resultado": summary})
+def _trace(tool, args, summary, evidence=None):
+    """Regista cada chamada de ferramenta. `evidence` = fontes que a chamada encontrou, mostradas na página como
+    Evidência: [{"kind": "sql"|"documento"|"contrato"|"alertas", "label": str, "detail": str, "link": str?}]."""
+    st.session_state.setdefault("trace", []).append({"ferramenta": tool, "argumentos": args, "resultado": summary,
+                                                     "evidencia": evidence or []})
 
 
 LABELS = {"consultar_sql": "A consultar os dados estruturados (SQL)",
@@ -135,7 +138,9 @@ def consultar_sql(sql: str) -> dict:
                       "cortado_em_100": truncated}
         except Exception as e:
             result = {"erro": f"{type(e).__name__}: {str(e)[:500]}"}
-    _trace("consultar_sql", {"sql": sql}, result.get("erro") or f"{result['n_linhas']} linhas")
+    _trace("consultar_sql", {"sql": sql}, result.get("erro") or f"{result['n_linhas']} linhas",
+           None if "erro" in result else [{"kind": "sql", "label": f"Consulta SQL · {result['n_linhas']} linhas",
+                                           "detail": sql.strip()}])
     return result
 
 
@@ -174,7 +179,14 @@ def pesquisar_documentos(pergunta: str, contract_id: int = 0, n_resultados: int 
         except Exception as e:
             result = {"erro": f"{type(e).__name__}: {str(e)[:500]}"}
     _trace("pesquisar_documentos", {"pergunta": pergunta, "contract_id": contract_id or None},
-           result.get("erro") or f"{len(result['passagens'])} passagens")
+           result.get("erro") or f"{len(result['passagens'])} passagens",
+           [{"kind": "documento",
+             "label": f"{p['fontes'][0]['ficheiro']} · contrato {p['fontes'][0]['contract_id']}"
+                      + (f" (e mais {len(p['fontes']) - 1 + p['outros_contratos_com_o_mesmo_texto']})"
+                         if len(p["fontes"]) > 1 or p["outros_contratos_com_o_mesmo_texto"] else ""),
+             "detail": " ".join(p["texto"].split())[:280] + "…",
+             "link": p["fontes"][0]["link_base"]}
+            for p in result.get("passagens", [])[:5] if p["fontes"]])
     return result
 
 
@@ -208,7 +220,12 @@ def obter_contrato(contract_id: int) -> dict:
                 SELECT file_name AS ficheiro, file_type AS tipo, status AS estado, pages AS paginas
                 FROM documents WHERE contract_id = ? ORDER BY file_name
             """, [int(contract_id)]).df())
-    _trace("obter_contrato", {"contract_id": contract_id}, result.get("erro") or result.get("object", "")[:80])
+    _trace("obter_contrato", {"contract_id": contract_id}, result.get("erro") or result.get("object", "")[:80],
+           None if "erro" in result else [{
+               "kind": "contrato", "label": f"Contrato {result['contract_id']}: {(result.get('object') or '')[:90]}",
+               "detail": f"{result.get('authority')} → {result.get('contractor')} · {lib.eur(result.get('contract_price'), 2)}"
+                         + (f" · {len(result['alertas'])} alerta(s)" if result.get("alertas") else ""),
+               "link": result.get("base_link"), "contractor": result.get("contractor")}])
     return result
 
 
@@ -240,7 +257,13 @@ def listar_alertas(indicador: str = "", entidade: str = "", limite: int = 20) ->
                   "contratos": _records(view[["contract_id", "object", "authority", "contractor", "procedure_type",
                                               "contract_price", "limit", "bidders", "publication_date", "alertas",
                                               "base_link"]])}
-    _trace("listar_alertas", {"indicador": indicador, "entidade": entidade}, result.get("erro") or f"{result['total_contratos_assinalados']} contratos")
+    _trace("listar_alertas", {"indicador": indicador, "entidade": entidade},
+           result.get("erro") or f"{result['total_contratos_assinalados']} contratos",
+           None if "erro" in result else [{
+               "kind": "alertas",
+               "label": (lib.flag_label(indicador, lib.DEFAULT_PARAMS) if indicador else "Contratos com alertas")
+                        + f" · {result['total_contratos_assinalados']} contratos",
+               "detail": ", ".join(str(c["contract_id"]) for c in result["contratos"][:10])}])
     return result
 
 
