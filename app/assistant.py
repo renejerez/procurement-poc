@@ -7,6 +7,7 @@ import re
 import time
 from datetime import date
 
+import pandas as pd
 import streamlit as st
 
 import lib
@@ -78,14 +79,15 @@ def _say(text):
             pass
 
 
-def _trace(tool, args, summary, evidence=None):
+def _trace(tool, args, summary, evidence=None, chart=None):
     """Regista cada chamada de ferramenta. `evidence` = fontes que a chamada encontrou, mostradas na página como
     Evidência: [{"kind": "sql"|"documento"|"contrato"|"alertas", "label": str, "detail": str, "link": str?}]."""
     st.session_state.setdefault("trace", []).append({"ferramenta": tool, "argumentos": args, "resultado": summary,
-                                                     "evidencia": evidence or []})
+                                                     "evidencia": evidence or [], "grafico": chart})
 
 
 LABELS = {"consultar_sql": "A consultar os dados estruturados (SQL)",
+          "criar_grafico": "A preparar o gráfico",
           "pesquisar_documentos": "A pesquisar nos documentos",
           "obter_contrato": "A obter a ficha do contrato",
           "listar_alertas": "A listar alertas"}
@@ -113,6 +115,18 @@ FORBIDDEN_SQL = re.compile(
 MAX_ROWS = 100
 
 
+def _check_sql(sql):
+    """Devolve (consulta limpa, erro). Só uma instrução SELECT/WITH, sem funções que leiam ficheiros ou mudem o estado."""
+    q = sql.strip().rstrip(";").strip()
+    if ";" in q:
+        return q, "Só é permitida uma instrução SQL de cada vez."
+    if not re.match(r"(?is)^(select|with)\b", q):
+        return q, "Só são permitidas consultas SELECT ou WITH."
+    if FORBIDDEN_SQL.search(q):
+        return q, f"A consulta usa uma instrução ou função não permitida: {FORBIDDEN_SQL.search(q).group(0)}"
+    return q, None
+
+
 def consultar_sql(sql: str) -> dict:
     """Executa uma consulta SQL (DuckDB) só de leitura sobre os dados estruturados dos contratos.
 
@@ -123,13 +137,9 @@ def consultar_sql(sql: str) -> dict:
         sql: a consulta SQL, por exemplo
             SELECT authority, SUM(contract_price) AS total FROM v_contracts GROUP BY 1 ORDER BY 2 DESC LIMIT 10
     """
-    q = sql.strip().rstrip(";").strip()
-    if ";" in q:
-        result = {"erro": "Só é permitida uma instrução SQL de cada vez."}
-    elif not re.match(r"(?is)^(select|with)\b", q):
-        result = {"erro": "Só são permitidas consultas SELECT ou WITH."}
-    elif FORBIDDEN_SQL.search(q):
-        result = {"erro": f"A consulta usa uma instrução ou função não permitida: {FORBIDDEN_SQL.search(q).group(0)}"}
+    q, err = _check_sql(sql)
+    if err:
+        result = {"erro": err}
     else:
         try:
             df = _cursor().execute(f"SELECT * FROM ({q}) AS resultado LIMIT {MAX_ROWS + 1}").df()
@@ -142,6 +152,79 @@ def consultar_sql(sql: str) -> dict:
            None if "erro" in result else [{"kind": "sql", "label": f"Consulta SQL · {result['n_linhas']} linhas",
                                            "detail": sql.strip()}])
     return result
+
+
+CHART_TYPES = {"dispersao", "barras", "linhas", "histograma", "caixa"}
+CHART_MAX_ROWS = 5000
+
+
+def criar_grafico(sql: str, tipo: str, x: str, y: str = "", cor: str = "", titulo: str = "",
+                  escala_log: bool = False) -> dict:
+    """Desenha um gráfico na resposta, com os dados de uma consulta SQL (só de leitura) aos dados estruturados.
+
+    Use SEMPRE esta ferramenta quando o utilizador pedir um gráfico, uma dispersão, uma evolução ou uma distribuição.
+    A aplicação corre a consulta e desenha o gráfico com os valores da base de dados; nunca escrevas os valores do
+    gráfico à mão nem desenhes gráficos em texto. Devolve um resumo dos dados (não os dados todos).
+
+    Args:
+        sql: consulta SELECT/WITH que devolve uma linha por ponto ou barra, com nomes de coluna claros, por exemplo
+            SELECT contract_price AS preco, base_price AS preco_base, procedure_type AS procedimento FROM contracts
+            WHERE base_price > 0
+        tipo: "dispersao" (x e y numéricos), "barras" (x categoria, y valor), "linhas" (x data ou ordem, y valor),
+            "histograma" (só x numérico) ou "caixa" (x categoria, y numérico)
+        x: nome da coluna para o eixo horizontal
+        y: nome da coluna para o eixo vertical (vazio no histograma)
+        cor: nome de uma coluna para colorir por grupo (opcional)
+        titulo: título curto do gráfico, em português
+        escala_log: true para eixo dos valores em escala logarítmica (útil para preços muito desiguais)
+    """
+    args = {"sql": sql, "tipo": tipo, "x": x, "y": y, "cor": cor, "titulo": titulo, "escala_log": escala_log}
+    q, err = _check_sql(sql)
+    chart = None
+    if not err and tipo not in CHART_TYPES:
+        err = f"Tipo de gráfico desconhecido: {tipo}. Use um de: {', '.join(sorted(CHART_TYPES))}."
+    if not err:
+        try:
+            df = _cursor().execute(f"SELECT * FROM ({q}) AS resultado LIMIT {CHART_MAX_ROWS + 1}").df()
+            cols = [c for c in (x, y, cor) if c]
+            missing = [c for c in cols if c not in df.columns]
+            if missing:
+                err = f"Colunas inexistentes no resultado: {missing}. Colunas disponíveis: {list(df.columns)}."
+            elif df.empty:
+                err = "A consulta não devolveu linhas: não há nada para desenhar."
+            elif tipo != "histograma" and not y:
+                err = "Falta a coluna y."
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:500]}"
+    if err:
+        result = {"erro": err}
+    else:
+        truncated = len(df) > CHART_MAX_ROWS
+        df = df.head(CHART_MAX_ROWS)
+        chart = {"tipo": tipo, "x": x, "y": y, "cor": cor, "titulo": titulo, "escala_log": bool(escala_log),
+                 "data": json.loads(df.to_json(orient="split", date_format="iso", force_ascii=False))}
+        summary = {}
+        for c in [c for c in (x, y) if c]:
+            col = df[c]
+            if pd.api.types.is_numeric_dtype(col):
+                summary[c] = {"min": _num(col.min()), "max": _num(col.max()), "mediana": _num(col.median())}
+            else:
+                summary[c] = {"valores_distintos": int(col.nunique())}
+        result = {"desenhado": True, "n_pontos": len(df), "cortado_em": CHART_MAX_ROWS if truncated else None,
+                  "colunas": list(df.columns), "resumo": summary,
+                  "nota": "O gráfico já aparece na resposta. Comenta o que mostra; não repitas os valores todos."}
+    _trace("criar_grafico", args, result.get("erro") or f"{tipo} · {result['n_pontos']} pontos",
+           None if "erro" in result else [{"kind": "sql", "label": f"Dados do gráfico · {result['n_pontos']} linhas",
+                                           "detail": sql.strip()}],
+           chart=chart)
+    return result
+
+
+def _num(v):
+    try:
+        return round(float(v), 2)
+    except (TypeError, ValueError):
+        return None
 
 
 def pesquisar_documentos(pergunta: str, contract_id: int = 0, n_resultados: int = 8) -> dict:
@@ -267,7 +350,7 @@ def listar_alertas(indicador: str = "", entidade: str = "", limite: int = 20) ->
     return result
 
 
-TOOLS = [timed(f) for f in (consultar_sql, pesquisar_documentos, obter_contrato, listar_alertas)]
+TOOLS = [timed(f) for f in (consultar_sql, criar_grafico, pesquisar_documentos, obter_contrato, listar_alertas)]
 
 # ─────────────────────────────── instruções ───────────────────────────────
 
@@ -304,6 +387,8 @@ Como responder:
 - Responde sempre em português de Portugal, de forma clara e concisa.
 - Baseia-te SÓ nos resultados das ferramentas. Nunca inventes números, nomes, datas ou cláusulas.
 - Números, totais, contagens, rankings e comparações: usa consultar_sql.
+- Gráficos (dispersão, barras, evolução, distribuição): usa criar_grafico, que desenha com os dados da base de dados.
+  Nunca desenhes gráficos em texto, tabelas ASCII ou código, e nunca inventes os valores; depois comenta o gráfico.
 - Conteúdo dos documentos (cláusulas, prazos, garantias, penalidades, requisitos, critérios): usa pesquisar_documentos;
   se a pergunta for sobre um contrato concreto, passa o contract_id.
 - Pergunta sobre um contrato concreto: começa por obter_contrato.

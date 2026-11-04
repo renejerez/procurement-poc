@@ -8,6 +8,7 @@ Tabelas criadas na procurement.duckdb:
 - rag_doc_map  que contratos/ficheiros têm esse texto (o mesmo caderno de encargos aparece em vários contratos)
 - rag_meta     modelo e parâmetros usados, para não misturar vetores de modelos diferentes
 """
+import hashlib
 import re
 import threading
 import time
@@ -167,9 +168,35 @@ def _fts_available(con):
                        "WHERE schema_name = 'fts_main_rag_chunks'").fetchall()[0][0] > 0
 
 
-STOPWORDS = set("""a o as os um uma uns umas de do da dos das em no na nos nas por para com sem sob sobre que qual quais
-quem como onde quando e ou se é são foi ser ao aos à às pelo pela pelos pelas este esta estes estas esse essa isso isto
-the of and to in for contrato contratos""".split())
+# Palavras vazias em português (artigos, preposições, contrações e conjunções muito frequentes).
+# Escritas em minúsculas e SEM acentos: o índice fts tira os acentos antes de as comparar ("à" -> "a", "é" -> "e").
+# Ficam fora do índice BM25 e da pergunta: ocorrem em quase todas as passagens e distorciam a pontuação.
+# Mudar esta lista faz o notebook 05 reconstruir o índice BM25 (os vetores não mudam).
+PT_STOPWORDS = tuple(sorted(set("""
+o a os as um uma uns umas
+a ante apos ate com contra de desde em entre para perante por sem sob sobre
+ao aos do da dos das dum duma duns dumas no na nos nas num numa nuns numas pelo pela pelos pelas
+deste desta destes destas desse dessa desses dessas daquele daquela daqueles daquelas
+neste nesta nestes nestas nesse nessa nesses nessas naquele naquela naqueles naquelas
+e ou nem que se mas como
+""".split())))
+FTS_STOPWORDS_TABLE = "rag_stopwords_pt"
+FTS_STOPWORDS_VERSION = "pt-" + hashlib.md5(" ".join(PT_STOPWORDS).encode()).hexdigest()[:8]   # muda com a lista
+
+# modo simples (sem a extensão fts): compara as palavras da pergunta tal como foram escritas, com e sem acentos
+STOPWORDS = set(PT_STOPWORDS) | set("""à às é são foi ser qual quais quem como onde quando este esta estes estas esse
+essa isso isto the of and to in for contrato contratos""".split())
+
+
+def build_fts_index(con):
+    """Cria (ou recria) o índice BM25 de rag_chunks sem as palavras vazias. Usado pelo notebook 05."""
+    con.execute("INSTALL fts; LOAD fts")
+    con.execute(f"CREATE OR REPLACE TABLE {FTS_STOPWORDS_TABLE} (sw VARCHAR)")
+    con.executemany(f"INSERT INTO {FTS_STOPWORDS_TABLE} VALUES (?)", [[w] for w in PT_STOPWORDS])
+    con.execute(f"""PRAGMA create_fts_index('rag_chunks', 'chunk_id', 'text', stemmer = 'portuguese',
+                    stopwords = '{FTS_STOPWORDS_TABLE}', strip_accents = 1, lower = 1, overwrite = 1)""")
+    con.execute("DELETE FROM rag_meta WHERE key = 'fts_stopwords'")
+    con.execute("INSERT INTO rag_meta VALUES ('fts_stopwords', ?)", [FTS_STOPWORDS_VERSION])
 
 
 def _keyword_terms(question):
@@ -181,8 +208,11 @@ def _keyword_terms(question):
 # da função match_bm25 do DuckDB, que dá resultados idênticos). A função original é chamada passagem a passagem
 # e, no DuckDB 2.0, demorava mais de 60 s; esta versão lê só as passagens que contêm os termos da pergunta.
 BM25_SQL = """
-WITH tokens AS (
-    SELECT DISTINCT stem(unnest(fts_main_rag_chunks.tokenize(?)), 'portuguese') AS t
+WITH words AS (
+    SELECT unnest(fts_main_rag_chunks.tokenize(?)) AS w
+),
+tokens AS (           -- as palavras vazias também saem da pergunta (lista passada como parâmetro)
+    SELECT DISTINCT stem(w, 'portuguese') AS t FROM words WHERE w <> '' AND w NOT IN (SELECT unnest(?::VARCHAR[]))
 ),
 qterms AS (
     SELECT t.docid, t.termid
@@ -245,7 +275,7 @@ def search(con, question, contract_id=None, k=8, candidates=40):
         try:
             keyword = con.execute(BM25_SQL.format(
                 scope="AND docs.name IN (SELECT c.chunk_id FROM rag_chunks c WHERE TRUE " + scope_sql + ")" if scope_sql else ""),
-                [question] + scope_params + [candidates]).fetchall()
+                [question, list(PT_STOPWORDS)] + scope_params + [candidates]).fetchall()
             keyword = [(cid,) for cid, _ in keyword]
         except Exception as e:                              # ex.: memória insuficiente: usar o modo simples
             print(f"  pesquisa: BM25 falhou ({type(e).__name__}: {str(e)[:120]}); a usar o modo simples", flush=True)

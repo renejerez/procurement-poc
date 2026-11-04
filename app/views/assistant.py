@@ -10,6 +10,7 @@ import html
 import time
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 import assistant
@@ -81,6 +82,59 @@ def new_chat() -> None:
 
 def eur(v: float) -> str:
     return lib.eur(v, 2)
+
+
+MONEY = ("preco", "preço", "price", "valor", "total", "montante", "gasto", "eur")
+
+
+def _label(col: str) -> str:
+    return col.replace("_", " ").strip().capitalize()
+
+
+def draw_chart(spec: dict, key: str) -> None:
+    """Desenha um gráfico pedido pelo assistente (ferramenta criar_grafico), com os dados da base de dados."""
+    try:
+        d = spec["data"]
+        df = pd.DataFrame(d["data"], columns=d["columns"])
+        x, y, cor = spec["x"], spec.get("y") or None, spec.get("cor") or None
+        for c in (x, y):                                   # datas em texto ISO -> datas
+            if c and not pd.api.types.is_numeric_dtype(df[c]) and df[c].astype(str).str.match(r"^\d{4}-\d{2}-\d{2}").all():
+                df[c] = pd.to_datetime(df[c])
+        tipo, log = spec["tipo"], bool(spec.get("escala_log"))
+        if log:                                            # log só faz sentido com valores positivos
+            for c in ([x, y] if tipo == "dispersao" else [x] if tipo == "histograma" else [y]):
+                if c and pd.api.types.is_numeric_dtype(df[c]):
+                    df = df[df[c] > 0]
+        labels = {c: _label(c) for c in df.columns}
+        common = dict(color=cor, labels=labels, title=spec.get("titulo") or None,
+                      color_discrete_sequence=["#1f4e8c"] + px.colors.qualitative.Safe)
+        if tipo == "dispersao":
+            fig = px.scatter(df, x=x, y=y, hover_data=list(df.columns), log_x=log, log_y=log, opacity=0.75, **common)
+        elif tipo == "barras":
+            fig = px.bar(df, x=x, y=y, log_y=log, **common)
+        elif tipo == "linhas":
+            fig = px.line(df.sort_values(x), x=x, y=y, markers=True, log_y=log, **common)
+        elif tipo == "histograma":
+            fig = px.histogram(df, x=x, nbins=40, log_x=log, **common)
+            fig.update_yaxes(title_text="N.º de contratos")
+        else:
+            fig = px.box(df, x=x, y=y, points="outliers", log_y=log, **common)
+        for axis, col in (("xaxis", x), ("yaxis", y)):
+            if not col:
+                continue
+            ax = getattr(fig.layout, axis)
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                fig.update_layout(**{axis: dict(tickformat="%m/%Y")})
+            elif ax.type == "log":                          # uma marca por potência de 10: 10, 100, 1.000 ...
+                fig.update_layout(**{axis: dict(dtick=1, tickformat=",.0f",
+                                                ticksuffix=" €" if any(m in col.lower() for m in MONEY) else "")})
+            elif any(m in col.lower() for m in MONEY) and pd.api.types.is_numeric_dtype(df[col]):
+                fig.update_layout(**{axis: dict(tickformat=",.0f", ticksuffix=" €")})
+        fig.update_layout(legend=dict(orientation="h", yanchor="top", y=-0.2, x=0))
+        st.plotly_chart(lib.style_fig(fig, 480), key=key)
+        st.caption(f"{lib.num(len(df))} pontos, calculados a partir da consulta na Evidência.")
+    except Exception as e:
+        st.caption(f"Não foi possível desenhar o gráfico ({type(e).__name__}).")
 
 
 # --------------------------------------------------------------------------
@@ -217,6 +271,9 @@ else:
 
     def render_answer(msg: dict, idx: int) -> None:
         st.markdown(msg["content"])
+        charts = [t["grafico"] for t in (msg.get("trace") or []) if t.get("grafico")]
+        for j, spec in enumerate(charts[-2:]):            # no máximo os 2 últimos gráficos da resposta
+            draw_chart(spec, key=f"chart_{idx}_{j}")
         ev = msg.get("evidence") or []
         if ev:
             with st.expander(f"Evidência ({len(ev)})"):
