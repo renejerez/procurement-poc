@@ -62,7 +62,7 @@ view = view.assign(alertas=view.apply(lambda r: " · ".join(lib.flags_for(r, par
 view = view.sort_values(["n_flags", "contract_price"], ascending=False)
 st.dataframe(
     view[["contract_id", "publication_date", "object", "authority", "contractor", "procedure_type",
-          "contract_price", "limit", "bidders", "n_flags", "alertas", "base_link"]],
+          "contract_price", "limit", "bidders", "n_flags", "alertas", "relacoes", "base_link"]],
     hide_index=True, height=480,
     column_config={
         "contract_id": st.column_config.NumberColumn("ID", format="%d"),
@@ -74,6 +74,9 @@ st.dataframe(
         "bidders": st.column_config.NumberColumn("Concorrentes", format="%d"),
         "n_flags": st.column_config.NumberColumn("N.º alertas", format="%d"),
         "alertas": st.column_config.TextColumn("Alertas", width="large"),
+        "relacoes": st.column_config.TextColumn("Empresas relacionadas", width="large",
+                                                help="Empresas ligadas por sócios ou gerentes/administradores comuns "
+                                                     "(atos societários publicados). Um alerta não é prova."),
         "base_link": st.column_config.LinkColumn("BASE", display_text="abrir"),
     },
 )

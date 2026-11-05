@@ -298,7 +298,42 @@ FLAGS = {
     "concentracao": ("Concentração no adjudicatário",
                      "Um adjudicatário recebe pelo menos {share:.0%} do valor em ajustes diretos e consultas prévias "
                      "de uma entidade (com 3 ou mais contratos)."),
+    # ── relações entre empresas (notebook 07: atos societários, tabela alertas_relacoes) ──
+    "concorrentes_relacionados": ("Concorrentes relacionados entre si",
+                                  "Duas empresas ligadas (sócio ou gerente/administrador em comum, ou uma é sócia ou "
+                                  "gestora da outra) concorreram no mesmo procedimento sem o ganharem juntas. "
+                                  "A concorrência pode não ser real. Consórcios não são assinalados."),
+    "rotacao_relacionados": ("Empresas relacionadas na mesma entidade",
+                             "Ajuste direto ou consulta prévia ganho por uma empresa quando uma empresa ligada a ela "
+                             "ganhou outro contrato da mesma entidade adjudicante no espaço de um ano. "
+                             "Pode indicar trabalho repartido entre empresas do mesmo grupo."),
 }
+RELATION_FLAGS = ("concorrentes_relacionados", "rotacao_relacionados")
+LINK_LABELS = {"shared_person": "pessoa em comum", "owns": "sócia", "manages": "gestora"}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _relation_alerts(path):
+    """Uma linha por contrato com os alertas de relações e o texto que os explica. Só NIFs e nomes de empresas:
+    os nomes das pessoas (tabela responsaveis) nunca são lidos pela aplicação."""
+    empty = pd.DataFrame(columns=["contract_id", *RELATION_FLAGS, "relacoes"])
+    if path is None:
+        return empty
+    con = _connection(path).cursor()
+    if con.execute("SELECT 1 FROM information_schema.tables WHERE table_name = 'alertas_relacoes'").fetchall() == []:
+        return empty
+    rows = con.execute("SELECT contract_id, rule, name_a, nif_a, name_b, nif_b, link_types FROM alertas_relacoes").df()
+    if rows.empty:
+        return empty
+
+    def describe(r):
+        how = ", ".join(LINK_LABELS.get(t.strip(), t.strip()) for t in str(r.link_types).split(","))
+        return f"{r.name_a or r.nif_a} ↔ {r.name_b or r.nif_b} ({how})"
+    rows["relacao"] = rows.apply(describe, axis=1)
+    out = rows.pivot_table(index="contract_id", columns="rule", values="relacao", aggfunc="size", fill_value=0) > 0
+    out = out.reindex(columns=list(RELATION_FLAGS), fill_value=False)
+    out["relacoes"] = rows.groupby("contract_id")["relacao"].agg(lambda s: " · ".join(sorted(set(s))))
+    return out.reset_index()
 
 
 def flag_label(key, params):
@@ -353,6 +388,10 @@ def compute_flags(df, pct=0.9, slip=0.2, days=30, share=0.25):
     conc = pair[(pair["share"] >= share) & (pair["n"] >= 3)].reset_index()[["authority_nif", "contractor_nif"]]
     conc_ids = ad.merge(conc, on=["authority_nif", "contractor_nif"])["contract_id"]
     d["concentracao"] = d["contract_id"].isin(conc_ids)
+
+    rel = _relation_alerts(db_snapshot()[0])
+    d = d.drop(columns=[c for c in [*RELATION_FLAGS, "relacoes"] if c in d.columns]).merge(rel, on="contract_id", how="left")
+    d["relacoes"] = d["relacoes"].fillna("")
 
     for key in FLAGS:
         d[key] = d[key].fillna(False).astype(bool)
