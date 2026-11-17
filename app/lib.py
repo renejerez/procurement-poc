@@ -2,6 +2,7 @@
 import os
 import shutil
 import tempfile
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -145,12 +146,12 @@ def _connection(path):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def _query(path, sql, params):
-    return _connection(path).cursor().execute(sql, list(params)).df()
+    return _connection(path).cursor().execute(sql, _thaw(params)).df()
 
 
 def query(sql, params=()):
     path, _ = db_snapshot()
-    return _query(path, sql, tuple(params))
+    return _query(path, sql, tuple(_freeze(p) for p in params))
 
 
 def has_table(name):
@@ -204,19 +205,124 @@ def style_fig(fig, height=None):
 
 EURO = st.column_config.NumberColumn("Valor (€)", format="localized")
 
-# ─────────────────────────────── contratos ───────────────────────────────
+# ─────────────────────────────── âmbito (base de dados nacional) ───────────────────────────────
+# A base de dados tem todos os contratos de Portugal (2012 em diante, ~2,3 milhões). Nunca se carregam todos para a
+# memória: cada página trabalha sobre um âmbito (distrito, concelho, anos) filtrado no DuckDB antes de chegar ao pandas.
+DOCS_SCOPE = ["Covilhã"]          # concelhos com documentos indexados (notebook 03: documents.scope no config.yaml)
+DEFAULT_DISTRICT = "Castelo Branco"
+DEFAULT_MUNICIPALITY = "Covilhã"
+ALL = "Todos"
+MAX_SCOPE_ROWS = 50_000           # contratos carregados por âmbito; o Streamlit Cloud tem pouca memória e o modelo RAG ocupa ~1 GB
 
 
-@st.cache_data(ttl=600, show_spinner="A carregar contratos...")
-def _contracts(path):
+class ScopeTooLarge(Exception):
+    def __init__(self, n):
+        super().__init__(f"{n} contratos")
+        self.n = n
+
+
+@dataclass(frozen=True)
+class Place:
+    district: str | None = None           # None = todos os distritos
+    municipality: str | None = None       # None = todos os concelhos do distrito
+    years: tuple = ()                     # anos de publicação; () = todos
+
+    @property
+    def label(self):
+        where = self.municipality or (f"distrito de {self.district}" if self.district else "Portugal")
+        if not self.years:
+            return f"{where} · todos os anos"
+        ys = sorted(self.years)
+        when = str(ys[0]) if len(ys) == 1 else (f"{ys[0]}–{ys[-1]}" if ys == list(range(ys[0], ys[-1] + 1))
+                                                 else ", ".join(map(str, ys)))
+        return f"{where} · {when}"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _places(path):
+    return _connection(path).cursor().execute("""
+        SELECT district, municipality, COUNT(DISTINCT contract_id) AS n
+        FROM contract_locations
+        WHERE country = 'Portugal' AND district IS NOT NULL AND municipality IS NOT NULL
+        GROUP BY ALL ORDER BY district, municipality
+    """).df()
+
+
+def places():
+    """Distritos e concelhos com contratos (tabela district, municipality, n)."""
+    return _places(db_snapshot()[0])
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _years(path):
     df = _connection(path).cursor().execute("""
-        WITH bids AS (
-            SELECT contract_id, COUNT(*) AS bidders
-            FROM contract_parties WHERE role = 'competitor' GROUP BY contract_id
+        SELECT DISTINCT CAST(year(publication_date) AS INTEGER) AS y FROM contracts
+        WHERE publication_date IS NOT NULL ORDER BY y DESC
+    """).df()
+    return df["y"].tolist()
+
+
+def years_available():
+    """Anos de publicação, do mais recente para o mais antigo."""
+    return _years(db_snapshot()[0])
+
+
+def place_ids_sql(place):
+    """SQL (e parâmetros) que devolve os contract_id de um âmbito. Um contrato com vários locais conta uma vez."""
+    conds, params = [], []
+    if place.district or place.municipality:
+        loc, lp = [], []
+        if place.district:
+            loc.append("district = ?")
+            lp.append(place.district)
+        if place.municipality:
+            loc.append("municipality = ?")
+            lp.append(place.municipality)
+        conds.append(f"contract_id IN (SELECT contract_id FROM contract_locations WHERE {' AND '.join(loc)})")
+        params += lp
+    if place.years:
+        conds.append("list_contains(?::INTEGER[], CAST(year(publication_date) AS INTEGER))")
+        params.append(list(place.years))
+    where = " AND ".join(conds) or "TRUE"
+    return f"SELECT contract_id FROM contracts WHERE {where}", params
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _count(path, ids_sql, params):
+    return _connection(path).cursor().execute(f"SELECT COUNT(*) FROM ({ids_sql})", list(params)).fetchone()[0]
+
+
+def count_ids(ids_sql, params=()):
+    return _count(db_snapshot()[0], ids_sql, tuple(_freeze(p) for p in params))
+
+
+def _freeze(p):
+    return tuple(p) if isinstance(p, list) else p
+
+
+def _thaw(params):
+    return [list(p) if isinstance(p, tuple) else p for p in params]
+
+
+@st.cache_data(ttl=600, show_spinner="A carregar contratos...", max_entries=6)
+def _load(path, ids_sql, params):
+    df = _connection(path).cursor().execute(f"""
+        WITH ids AS ({ids_sql}),
+        names AS (
+            SELECT p.contract_id, p.role,
+                   string_agg(p.nif, ' + ' ORDER BY p.nif)  AS nifs,
+                   string_agg(e.name, ' + ' ORDER BY p.nif) AS names
+            FROM contract_parties p JOIN entities e USING (nif)
+            WHERE p.role IN ('authority', 'contractor') AND p.contract_id IN (SELECT contract_id FROM ids)
+            GROUP BY ALL
+        ),
+        bids AS (
+            SELECT contract_id, COUNT(*) AS bidders FROM contract_parties
+            WHERE role = 'competitor' AND contract_id IN (SELECT contract_id FROM ids) GROUP BY contract_id
         ),
         cpv AS (
             SELECT contract_id, MIN(cpv_code) AS cpv_code, ARG_MIN(cpv_description, cpv_code) AS cpv_description
-            FROM contract_cpvs GROUP BY contract_id
+            FROM contract_cpvs WHERE contract_id IN (SELECT contract_id FROM ids) GROUP BY contract_id
         )
         SELECT c.contract_id, c.publication_date, c.signing_date, c.award_decision_date, c.close_date,
                c.procedure_type, c.contract_types, c.object, c.legal_basis,
@@ -224,13 +330,15 @@ def _contracts(path):
                CAST(c.contract_price AS DOUBLE)  AS contract_price,
                CAST(c.effective_price AS DOUBLE) AS effective_price,
                c.execution_days, c.documents_link, c.year,
-               v.authority_nif, v.authority, v.contractor_nif, v.contractor,
+               a.nifs AS authority_nif, a.names AS authority, k.nifs AS contractor_nif, k.names AS contractor,
                b.bidders, cpv.cpv_code, cpv.cpv_description
         FROM contracts c
-        JOIN v_contracts v USING (contract_id)
-        LEFT JOIN bids b USING (contract_id)
-        LEFT JOIN cpv USING (contract_id)
-    """).df()
+        LEFT JOIN names a ON a.contract_id = c.contract_id AND a.role = 'authority'
+        LEFT JOIN names k ON k.contract_id = c.contract_id AND k.role = 'contractor'
+        LEFT JOIN bids b ON b.contract_id = c.contract_id
+        LEFT JOIN cpv ON cpv.contract_id = c.contract_id
+        WHERE c.contract_id IN (SELECT contract_id FROM ids)
+    """, _thaw(params)).df()
     for col in ["publication_date", "signing_date", "award_decision_date", "close_date"]:
         df[col] = pd.to_datetime(df[col])
     df["authority"] = df["authority"].fillna("(sem entidade)")
@@ -240,27 +348,78 @@ def _contracts(path):
     return df
 
 
-def contracts():
-    path, _ = db_snapshot()
-    return _contracts(path)
+def load_contracts(ids_sql, params=(), max_rows=MAX_SCOPE_ROWS):
+    """Carrega os contratos devolvidos por ids_sql. Recusa (ScopeTooLarge) se forem mais de max_rows."""
+    frozen = tuple(_freeze(p) for p in params)
+    n = count_ids(ids_sql, frozen)
+    if n > max_rows:
+        raise ScopeTooLarge(n)
+    return _load(db_snapshot()[0], ids_sql, frozen)
+
+
+def contracts_in_scope(place):
+    return load_contracts(*place_ids_sql(place))
+
+
+def contracts_matching(place, entity_text, max_rows=MAX_SCOPE_ROWS):
+    """Contratos do âmbito em que a entidade adjudicante ou o adjudicatário contém entity_text (ou é esse NIF)."""
+    ids_sql, params = place_ids_sql(place)
+    ids_sql += """ AND contract_id IN (
+        SELECT p.contract_id FROM contract_parties p JOIN entities e USING (nif)
+        WHERE p.role IN ('authority', 'contractor') AND (e.name ILIKE ? OR p.nif = ?))"""
+    return load_contracts(ids_sql, [*params, f"%{entity_text}%", entity_text.strip()], max_rows)
+
+
+def contracts_for_contract(contract_id):
+    """O contrato e os outros contratos da(s) mesma(s) entidade(s) adjudicante(s) no mesmo ano: o contexto de que os
+    indicadores precisam (fracionamento e concentração são calculados por entidade)."""
+    ids_sql = """
+        SELECT DISTINCT p.contract_id FROM contract_parties p JOIN contracts c USING (contract_id)
+        WHERE p.role = 'authority'
+          AND p.nif IN (SELECT nif FROM contract_parties WHERE contract_id = ? AND role = 'authority')
+          AND year(c.publication_date) = (SELECT year(publication_date) FROM contracts WHERE contract_id = ?)
+        UNION SELECT ?"""
+    return load_contracts(ids_sql, [int(contract_id)] * 3, max_rows=10 * MAX_SCOPE_ROWS)
+
+
+def _index_of(options, value, default=0):
+    return options.index(value) if value in options else default
+
+
+def place_selector():
+    """Âmbito geográfico e temporal (barra lateral), partilhado por todas as páginas exceto o Assistente."""
+    st.sidebar.header("Âmbito")
+    pl = places()
+    districts = sorted(pl["district"].unique().tolist())
+    d_opts = [ALL] + districts
+    # o valor escolhido fica guardado pela key do widget; o index só define o valor da primeira vez
+    district = st.sidebar.selectbox("Distrito", d_opts, key="p_district", index=_index_of(d_opts, DEFAULT_DISTRICT))
+    munis = sorted(pl.loc[pl["district"] == district, "municipality"].tolist()) if district != ALL else []
+    m_opts = [ALL] + munis
+    muni = st.sidebar.selectbox("Concelho", m_opts, key="p_muni", index=_index_of(m_opts, DEFAULT_MUNICIPALITY),
+                                disabled=district == ALL)
+    years = years_available()
+    sel_years = st.sidebar.multiselect("Ano de publicação", years, default=years[:1], key="p_years",
+                                       placeholder="Todos os anos")
+    return Place(None if district == ALL else district,
+                 None if district == ALL or muni == ALL else muni,
+                 tuple(sorted(int(y) for y in sel_years)))
 
 
 def sidebar_filters(df):
-    """Filtros globais (barra lateral), aplicados em todas as páginas."""
+    """Filtros dentro do âmbito (barra lateral), aplicados em todas as páginas."""
     st.sidebar.header("Filtros")
-    years = sorted(df["publication_date"].dt.year.dropna().astype(int).unique())
-    sel_years = st.sidebar.multiselect("Ano de publicação", years, default=years, key="f_years")
     authorities = df.groupby("authority")["contract_price"].sum().sort_values(ascending=False).index.tolist()
     sel_auth = st.sidebar.multiselect("Entidade adjudicante", authorities, key="f_auth",
                                       placeholder="Todas")
     procs = df["procedure_type"].value_counts().index.tolist()
     sel_proc = st.sidebar.multiselect("Tipo de procedimento", procs, key="f_proc", placeholder="Todos")
-    out = df[df["publication_date"].dt.year.isin(sel_years)]
+    out = df
     if sel_auth:
         out = out[out["authority"].isin(sel_auth)]
     if sel_proc:
         out = out[out["procedure_type"].isin(sel_proc)]
-    st.sidebar.caption(f"{num(len(out))} de {num(len(df))} contratos")
+    st.sidebar.caption(f"{num(len(out))} de {num(len(df))} contratos no âmbito")
     return out
 
 

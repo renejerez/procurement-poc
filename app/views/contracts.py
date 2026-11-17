@@ -6,11 +6,13 @@ df = lib.compute_flags(st.session_state["filtered"], **lib.DEFAULT_PARAMS)
 docs_available = lib.has_table("documents")
 
 st.title("Contratos")
+st.caption(f"Âmbito: {st.session_state['place'].label}")
 
 c1, c2, c3 = st.columns([3, 1, 1])
 text = c1.text_input("Pesquisar no objeto do contrato", placeholder="ex.: iluminação, pavimentação, software...")
 in_docs = c2.toggle("Incluir documentos", disabled=not docs_available,
-                    help="Procura também no texto extraído das peças do procedimento (notebook 03).")
+                    help="Procura também no texto extraído das peças do procedimento (notebook 03). "
+                     f"Só há documentos para: {', '.join(lib.DOCS_SCOPE)}.")
 only_flagged = c3.toggle("Só com alertas")
 
 price_max = float(df["contract_price"].max() or 0)

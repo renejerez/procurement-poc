@@ -7,6 +7,7 @@ import re
 import time
 from datetime import date
 
+import pandas as pd
 import streamlit as st
 
 import lib
@@ -191,8 +192,12 @@ def obter_contrato(contract_id: int) -> dict:
     Args:
         contract_id: o ID do contrato no portal BASE (por exemplo 15645692)
     """
-    flags = lib.compute_flags(lib.contracts(), **lib.DEFAULT_PARAMS)
-    row = flags[flags["contract_id"] == int(contract_id)]
+    try:
+        # o contrato e os outros da mesma entidade adjudicante no mesmo ano (contexto dos indicadores)
+        flags = lib.compute_flags(lib.contracts_for_contract(int(contract_id)), **lib.DEFAULT_PARAMS)
+        row = flags[flags["contract_id"] == int(contract_id)]
+    except (ValueError, TypeError):
+        row = pd.DataFrame()
     if row.empty:
         result = {"erro": f"Contrato {contract_id} não encontrado na base de dados."}
     else:
@@ -209,6 +214,10 @@ def obter_contrato(contract_id: int) -> dict:
             SELECT e.name AS nome, p.nif FROM contract_parties p JOIN entities e USING (nif)
             WHERE p.contract_id = ? AND p.role = 'competitor' ORDER BY e.name
         """, [int(contract_id)]).df())
+        locais = cur.execute("""
+            SELECT DISTINCT district AS distrito, municipality AS concelho FROM contract_locations WHERE contract_id = ?
+        """, [int(contract_id)]).df()
+        result["locais_de_execucao"] = _records(locais)
         if lib.has_table("documents"):
             result["documentos"] = _records(cur.execute("""
                 SELECT file_name AS ficheiro, file_type AS tipo, status AS estado, pages AS paginas
@@ -218,8 +227,12 @@ def obter_contrato(contract_id: int) -> dict:
     return result
 
 
-def listar_alertas(indicador: str = "", entidade: str = "", limite: int = 20) -> dict:
+def listar_alertas(indicador: str = "", concelho: str = "", distrito: str = "", ano: int = 0,
+                   entidade: str = "", limite: int = 20) -> dict:
     """Lista contratos assinalados pelos indicadores de risco, ordenados por número de alertas e valor.
+
+    Os indicadores são calculados sobre um âmbito: indique pelo menos um concelho, um distrito ou uma entidade,
+    e de preferência o ano. Âmbitos com mais de 50.000 contratos são recusados (escolha menos anos ou um local).
 
     Indicadores disponíveis (use o código): proposta_unica, perto_limiar, acima_limiar, fracionamento,
     acima_preco_base, derrapagem, publicacao_tardia, concentracao, concorrentes_relacionados (empresas ligadas
@@ -228,27 +241,54 @@ def listar_alertas(indicador: str = "", entidade: str = "", limite: int = 20) ->
 
     Args:
         indicador: código do indicador, ou vazio para todos
-        entidade: parte do nome da entidade adjudicante ou do adjudicatário, para filtrar (opcional)
+        concelho: nome do concelho, como em contract_locations.municipality (ex.: "Covilhã", "Lisboa")
+        distrito: nome do distrito, como em contract_locations.district (ex.: "Porto", "Braganca")
+        ano: ano de publicação (0 = todos os anos do âmbito)
+        entidade: parte do nome (ou NIF) da entidade adjudicante ou do adjudicatário (opcional)
         limite: número máximo de contratos a devolver (até 50)
     """
-    df = lib.compute_flags(lib.contracts(), **lib.DEFAULT_PARAMS)
+    place = lib.Place(distrito.strip() or None, concelho.strip() or None, (int(ano),) if ano else ())
+    df = None
     if indicador and indicador not in lib.FLAGS:
         result = {"erro": f"Indicador desconhecido. Use um de: {', '.join(lib.FLAGS)}"}
+    elif not (place.district or place.municipality or entidade.strip()):
+        result = {"erro": "Indique um concelho, um distrito ou uma entidade (e de preferência o ano): os indicadores "
+                          "não são calculados para o país inteiro de uma vez."}
+    else:
+        try:
+            raw = lib.contracts_matching(place, entidade) if entidade.strip() else lib.contracts_in_scope(place)
+            df = lib.compute_flags(raw, **lib.DEFAULT_PARAMS)
+            result = None
+        except lib.ScopeTooLarge as e:
+            result = {"erro": f"O âmbito tem {e.n} contratos (máximo {lib.MAX_SCOPE_ROWS}). Restrinja ao ano, a um "
+                              "concelho ou a uma entidade."}
+    if df is None:
+        pass
+    elif df.empty:
+        result = {"erro": f"Não há contratos no âmbito {place.label}" + (f" para «{entidade}»" if entidade else "")
+                          + ". Confirme a grafia do concelho/distrito (ex.: 'Braganca' sem cedilha) ou da entidade."}
     else:
         view = df[df[indicador]] if indicador else df[df["n_flags"] > 0]
         if entidade:
-            m = view["authority"].str.contains(entidade, case=False, regex=False) | \
-                view["contractor"].str.contains(entidade, case=False, regex=False)
+            e = entidade.strip()
+            m = (view["authority"].str.contains(e, case=False, regex=False)
+                 | view["contractor"].str.contains(e, case=False, regex=False)
+                 | view["authority_nif"].fillna("").str.contains(e, regex=False)
+                 | view["contractor_nif"].fillna("").str.contains(e, regex=False))
             view = view[m]
         total, value = len(view), float(view["contract_price"].sum())
         view = view.sort_values(["n_flags", "contract_price"], ascending=False).head(max(1, min(int(limite), 50)))
-        view = view.assign(alertas=view.apply(lambda r: lib.flags_for(r, lib.DEFAULT_PARAMS), axis=1))
-        result = {"total_contratos_assinalados": total, "valor_total": round(value, 2),
+        view = view.assign(alertas=[lib.flags_for(r, lib.DEFAULT_PARAMS) for _, r in view.iterrows()])
+        result = {"ambito": place.label + (f" · entidade «{entidade}»" if entidade else ""),
+                  "contratos_no_ambito": len(df),
+                  "total_contratos_assinalados": total, "valor_total": round(value, 2),
                   "indicadores": {k: lib.flag_help(k, lib.DEFAULT_PARAMS) for k in ([indicador] if indicador else lib.FLAGS)},
                   "contratos": _records(view[["contract_id", "object", "authority", "contractor", "procedure_type",
                                               "contract_price", "limit", "bidders", "publication_date", "alertas",
                                               "relacoes", "base_link"]])}
-    _trace("listar_alertas", {"indicador": indicador, "entidade": entidade}, result.get("erro") or f"{result['total_contratos_assinalados']} contratos")
+    _trace("listar_alertas", {"indicador": indicador, "concelho": concelho, "distrito": distrito, "ano": ano,
+                              "entidade": entidade},
+           result.get("erro") or f"{result['total_contratos_assinalados']} contratos")
     return result
 
 
@@ -257,7 +297,7 @@ TOOLS = [timed(f) for f in (consultar_sql, pesquisar_documentos, obter_contrato,
 # ─────────────────────────────── instruções ───────────────────────────────
 
 SCHEMA_NOTES = """
-Tabelas (DuckDB). Valores em euros, sem IVA.
+Tabelas (DuckDB). Valores em euros, sem IVA. A base tem ~2,3 milhões de contratos: filtre SEMPRE por local e/ou ano.
 - v_contracts (USE ESTA para quase tudo): uma linha por contrato.
   contract_id, publication_date, procedure_type, object, contract_price,
   authority_nif, authority (entidade adjudicante), contractor_nif, contractor (adjudicatário).
@@ -265,14 +305,27 @@ Tabelas (DuckDB). Valores em euros, sem IVA.
 - contracts: todos os campos de cada contrato. Colunas úteis: contract_id, procedure_id, procedure_type, contract_types,
   object, description, publication_date, award_decision_date, signing_date, close_date, base_price, contract_price,
   effective_price, execution_days, legal_basis, direct_award_justification, framework_agreement, centralized,
-  green_contract, documents_link, year. NÃO selecione raw_record.
+  green_contract, documents_link, year (ano do contrato segundo o IMPIC). NÃO selecione raw_record (está vazio).
+  Para "contratos de 2025" use year(publication_date) = 2025 (ano de publicação, como na aplicação).
 - entities(nif, name): entidades e empresas, identificadas pelo NIF.
 - contract_parties(contract_id, nif, role, is_sme): role = 'authority' | 'contractor' | 'competitor' (concorrente).
   Número de concorrentes de um contrato = COUNT(*) com role = 'competitor'.
+  is_sme (PME) só está preenchido a partir de 2024; antes disso é quase sempre NULL (o IMPIC não o publicava).
 - contract_cpvs(contract_id, cpv_code, cpv_description)
-- contract_locations(contract_id, country, district, municipality)
+- contract_locations(contract_id, country, district, municipality): locais de execução. Um contrato pode ter
+  vários locais, por isso filtre com contract_id IN (SELECT contract_id FROM contract_locations WHERE ...) e
+  NUNCA com JOIN (contaria o mesmo contrato várias vezes).
+  municipality = concelho; district = distrito. Atenção: o distrito "Lisboa" e o concelho "Lisboa" são coisas
+  diferentes; se o utilizador disser só "Lisboa", use o concelho e diga-o. Grafias do IMPIC: "Braganca" (sem
+  cedilha), "Região Autónoma da Madeira", "Região Autónoma dos Açores". Há contratos sem distrito/concelho
+  (só "Portugal", "Portugal Continental" ou "Distrito não determinado"): ficam fora de filtros por local.
 - documents(contract_id, file_name, file_type, pages, status, text): NÃO selecione a coluna text; para o conteúdo dos
   documentos use a ferramenta pesquisar_documentos.
+Exemplo — gasto por entidade no concelho de Lisboa em 2025:
+  SELECT authority, COUNT(*) AS contratos, SUM(contract_price) AS total FROM v_contracts
+  WHERE contract_id IN (SELECT contract_id FROM contract_locations WHERE municipality = 'Lisboa')
+    AND year(publication_date) = 2025
+  GROUP BY 1 ORDER BY 3 DESC LIMIT 10
 Valores de procedure_type: 'Ajuste Direto Regime Geral', 'Consulta Prévia', 'Concurso público',
 'Concurso limitado por prévia qualificação', 'Ao abrigo de acordo-quadro (art.º 259.º)',
 'Ao abrigo de acordo-quadro (art.º 258.º)', 'Consulta Prévia Simplificada', 'Contratação excluída II', ...
@@ -281,21 +334,30 @@ Para procurar nomes use ILIKE '%...%' (os nomes variam na grafia) ou, melhor, o 
 
 
 def system_instruction():
+    docs = ", ".join(lib.DOCS_SCOPE)
     return f"""És o assistente de análise de contratação pública de um projeto de mestrado da Universidade da Beira Interior.
-Os dados são contratos públicos com local de execução no concelho da Covilhã, publicados no portal BASE (IMPIC),
-e o texto extraído das peças dos procedimentos. Hoje é {date.today():%d/%m/%Y}.
+Os dados são os contratos públicos de todo o país publicados no portal BASE (IMPIC), de 2012 até hoje, e o texto
+extraído das peças dos procedimentos — este só existe, por agora, para contratos do concelho de {docs}.
+Hoje é {date.today():%d/%m/%Y}.
 
 Como responder:
 - Responde sempre em português de Portugal, de forma clara e concisa.
 - Baseia-te SÓ nos resultados das ferramentas. Nunca inventes números, nomes, datas ou cláusulas.
-- Números, totais, contagens, rankings e comparações: usa consultar_sql.
+- Âmbito: cada mensagem traz o âmbito escolhido pelo utilizador (concelho ou todo o país, ano, procedimento).
+  Aplica-o a totais, contagens e listas, salvo se a pergunta indicar outro local ou ano. Diz sempre na resposta
+  que local e que período usaste.
+- Números, totais, contagens, rankings e comparações: usa consultar_sql, sempre com filtro de local e/ou ano
+  (ver as notas sobre contract_locations). Totais nacionais são possíveis, mas filtra pelo menos o ano.
 - Conteúdo dos documentos (cláusulas, prazos, garantias, penalidades, requisitos, critérios): usa pesquisar_documentos;
-  se a pergunta for sobre um contrato concreto, passa o contract_id.
+  se a pergunta for sobre um contrato concreto, passa o contract_id. Só há documentos indexados de {docs}: para
+  contratos de outros locais, diz que os documentos ainda não estão disponíveis na aplicação e dá o link do BASE e,
+  se existir, o documents_link do contrato (obtido com obter_contrato).
 - Pergunta sobre um contrato concreto: começa por obter_contrato.
-- Riscos ou irregularidades: usa listar_alertas e explica o que cada indicador significa. Os alertas são indícios
-  que merecem análise, não provas; nunca acuses ninguém de ilegalidade.
-- Se uma ferramenta der erro, corrige e tenta de novo UMA vez (por exemplo, ajusta o SQL). Se voltar a falhar,
-  não insistas: responde com o que já tens e diz o que não foi possível consultar.
+- Riscos ou irregularidades: usa listar_alertas com o concelho (ou distrito, ou entidade) e o ano do âmbito, e
+  explica o que cada indicador significa. Os indicadores são calculados dentro desse âmbito. Os alertas são
+  indícios que merecem análise, não provas; nunca acuses ninguém de ilegalidade.
+- Se uma ferramenta der erro, corrige e tenta de novo UMA vez (por exemplo, ajusta o SQL ou restringe o âmbito).
+  Se voltar a falhar, não insistas: responde com o que já tens e diz o que não foi possível consultar.
 - Usa no máximo 5 chamadas de ferramentas por pergunta.
 - Se os dados não permitirem responder, diz isso claramente e explica o que falta.
 - Cita as fontes: para contratos, um link no formato [contrato 15645692](https://www.base.gov.pt/Base4/pt/detalhe/?type=contratos&id=15645692);

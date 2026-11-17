@@ -13,9 +13,11 @@ _, updated = lib.db_snapshot()
 general = lib.query("""
     SELECT COUNT(*) AS contracts, MIN(publication_date) AS first_pub, MAX(publication_date) AS last_pub,
            MAX(loaded_at) AS loaded_at,
-           COUNT(*) FILTER (WHERE documents_link IS NOT NULL) AS with_link
+           COUNT(*) FILTER (WHERE documents_link IS NOT NULL) AS with_link_all,
+           COUNT(*) FILTER (WHERE documents_link IS NOT NULL AND contract_id IN (
+               SELECT contract_id FROM contract_locations WHERE list_contains(?, municipality))) AS with_link
     FROM contracts
-""").iloc[0]
+""", [lib.DOCS_SCOPE]).iloc[0]
 entities = lib.query("SELECT COUNT(*) AS n FROM entities")["n"].iloc[0]
 
 st.subheader("1–2 · Contratos e armazenamento")
@@ -25,7 +27,15 @@ m2.metric("Entidades (por NIF)", lib.num(entities))
 m3.metric("Último contrato publicado", f"{general['last_pub']:%d/%m/%Y}", help=f"Primeiro: {general['first_pub']:%d/%m/%Y}")
 m4.metric("Último carregamento", f"{general['loaded_at']:%d/%m/%Y %H:%M}" if general["loaded_at"] == general["loaded_at"] else "—")
 
-st.subheader("3 · Documentos")
+by_year = lib.query("""
+    SELECT CAST(year(publication_date) AS INTEGER) AS ano, COUNT(*) AS contratos,
+           SUM(CAST(contract_price AS DOUBLE)) AS valor
+    FROM contracts WHERE publication_date >= DATE '2012-01-01' GROUP BY 1 ORDER BY 1
+""")
+st.plotly_chart(lib.style_fig(px.bar(by_year, x="ano", y="contratos", labels={"ano": "", "contratos": "Contratos"},
+                                     title="Contratos por ano de publicação (todo o país)"), 280))
+
+st.subheader(f"3 · Documentos ({', '.join(lib.DOCS_SCOPE)})")
 if not (lib.has_table("document_fetch_log") and lib.has_table("documents")):
     st.info("O notebook 03 ainda não foi executado sobre esta base de dados.")
     st.stop()
@@ -40,7 +50,9 @@ fetched = int(log["contracts"].sum())
 ok = int(log.loc[log["status"] == "ok", "contracts"].sum())
 
 m1, m2, m3 = st.columns(3)
-m1.metric("Contratos com link para as peças", lib.num(general["with_link"]))
+m1.metric(f"Com link para as peças ({', '.join(lib.DOCS_SCOPE)})", lib.num(general["with_link"]),
+          help=f"No país inteiro: {lib.num(general['with_link_all'])}. Só os concelhos de documents.scope "
+               "(config.yaml) têm os documentos descarregados.")
 m2.metric("Já processados", f"{lib.num(fetched)} ({fetched / max(general['with_link'], 1):.0%})")
 m3.metric("Com documentos obtidos", lib.num(ok))
 st.progress(min(fetched / max(general["with_link"], 1), 1.0))

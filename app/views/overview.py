@@ -4,9 +4,11 @@ import streamlit as st
 import lib
 
 df = st.session_state["filtered"]
+place = st.session_state["place"]
 
-st.title("Contratação pública na Covilhã")
-st.caption("Contratos públicos com local de execução no concelho da Covilhã, publicados no portal BASE.")
+st.title(f"Contratação pública — {place.municipality or (place.district or 'Portugal')}")
+st.caption(f"Contratos públicos publicados no portal BASE · âmbito: {place.label}. "
+           "Um contrato com vários locais de execução conta uma vez.")
 
 if df.empty:
     st.info("Nenhum contrato corresponde aos filtros.")
@@ -23,7 +25,8 @@ st.subheader("Valor publicado por mês")
 monthly = df.groupby(["month", "procedure_type"], as_index=False)["contract_price"].sum()
 fig = px.bar(monthly, x="month", y="contract_price", color="procedure_type",
              labels={"month": "", "contract_price": "Valor (€)", "procedure_type": "Procedimento"})
-fig.update_xaxes(dtick="M1", tickformat="%m/%Y")
+fig.update_xaxes(dtick="M1" if monthly["month"].nunique() <= 24 else "M12",
+                 tickformat="%m/%Y" if monthly["month"].nunique() <= 24 else "%Y")
 st.plotly_chart(lib.style_fig(fig, 420))
 
 left, right = st.columns(2)

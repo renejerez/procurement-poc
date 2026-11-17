@@ -20,11 +20,19 @@ FLAG_PRIORITY = ["proposta_unica", "fracionamento", "acima_limiar", "perto_limia
                  "derrapagem", "concentracao", "publicacao_tardia"]
 
 
+COUNTRY = "Todo o país"
+
+
 @dataclass
 class Scope:
-    municipio: str
+    municipio: str             # concelho, ou COUNTRY
     ano: int | None            # None = todos os anos
     procedimento: str | None   # None = todos
+
+    @property
+    def place(self) -> lib.Place:
+        return lib.Place(None, None if self.municipio == COUNTRY else self.municipio,
+                         (self.ano,) if self.ano else ())
 
 
 @dataclass
@@ -67,22 +75,19 @@ def _in_scope(df: pd.DataFrame, scope: Scope) -> pd.DataFrame:
 # Opções de âmbito (dentro do composer)
 # --------------------------------------------------------------------------
 def scope_options() -> dict:
+    """Concelhos (o predefinido primeiro, depois todo o país e os outros por ordem alfabética), anos e procedimentos."""
     try:
-        df = lib.contracts()
-        # municípios cobertos pela recolha: os que aparecem em pelo menos metade dos contratos
-        # (hoje só a Covilhã; com a recolha nacional passam a aparecer todos)
-        locs = lib.query("""
-            SELECT municipality, COUNT(DISTINCT contract_id) AS n FROM contract_locations
-            WHERE municipality IS NOT NULL GROUP BY 1 ORDER BY 2 DESC
-        """)
-        total = max(len(df), 1)
-        municipios = locs.loc[locs["n"] >= total / 2, "municipality"].tolist() or locs["municipality"].head(1).tolist()
-        anos = sorted(df["publication_date"].dt.year.dropna().astype(int).unique().tolist(), reverse=True)
-        procedimentos = df["procedure_type"].value_counts().index.tolist()
-        return {"municipios": municipios or ["Covilhã"], "anos": anos, "procedimentos": procedimentos}
+        munis = sorted(set(lib.places()["municipality"]))
+        first = [lib.DEFAULT_MUNICIPALITY] if lib.DEFAULT_MUNICIPALITY in munis else []
+        municipios = first + [COUNTRY] + [m for m in munis if m not in first]
+        procedimentos = lib.query("""
+            SELECT procedure_type FROM contracts WHERE procedure_type IS NOT NULL
+            GROUP BY 1 ORDER BY COUNT(*) DESC
+        """)["procedure_type"].tolist()
+        return {"municipios": municipios, "anos": lib.years_available(), "procedimentos": procedimentos}
     except Exception as e:
         print(f"scope_options: {type(e).__name__}: {e}", flush=True)
-        return {"municipios": ["Covilhã"], "anos": [], "procedimentos": []}
+        return {"municipios": [lib.DEFAULT_MUNICIPALITY, COUNTRY], "anos": [], "procedimentos": []}
 
 
 # --------------------------------------------------------------------------
@@ -104,10 +109,23 @@ def last_pipeline_run() -> pd.Timestamp | None:
 # KPI numa linha (as mesmas contas da Visão geral)
 # --------------------------------------------------------------------------
 def kpis(scope: Scope) -> dict:
+    """Calculado no DuckDB (agregados), por isso funciona também para todo o país."""
     try:
-        df = _in_scope(lib.contracts(), scope)
-        return {"contratos": len(df), "valor": float(df["contract_price"].sum()),
-                "entidades": int(df["authority_nif"].nunique()), "adjudicatarios": int(df["contractor_nif"].nunique())}
+        ids_sql, params = lib.place_ids_sql(scope.place)
+        if scope.procedimento:
+            ids_sql += " AND procedure_type = ?"
+            params = [*params, scope.procedimento]
+        r = lib.query(f"""
+            WITH ids AS ({ids_sql})
+            SELECT (SELECT COUNT(*) FROM ids) AS contratos,
+                   (SELECT SUM(CAST(contract_price AS DOUBLE)) FROM contracts WHERE contract_id IN (SELECT contract_id FROM ids)) AS valor,
+                   (SELECT COUNT(DISTINCT nif) FROM contract_parties
+                     WHERE role = 'authority' AND contract_id IN (SELECT contract_id FROM ids)) AS entidades,
+                   (SELECT COUNT(DISTINCT nif) FROM contract_parties
+                     WHERE role = 'contractor' AND contract_id IN (SELECT contract_id FROM ids)) AS adjudicatarios
+        """, params).iloc[0]
+        return {"contratos": int(r["contratos"]), "valor": float(r["valor"] or 0),
+                "entidades": int(r["entidades"]), "adjudicatarios": int(r["adjudicatarios"])}
     except Exception as e:
         print(f"kpis: {type(e).__name__}: {e}", flush=True)
         return {"contratos": 0, "valor": 0.0, "entidades": 0, "adjudicatarios": 0}
@@ -119,8 +137,13 @@ def kpis(scope: Scope) -> dict:
 # --------------------------------------------------------------------------
 def briefing(scope: Scope, limit: int = 3) -> tuple[int, int, list[Flag], pd.Timestamp | None]:
     """Devolve (n.º de contratos recentes, n.º desses com alertas, os `limit` mais graves, data mais recente)."""
+    if scope.municipio == COUNTRY:
+        return 0, 0, [], None                  # o Briefing é por concelho (os indicadores precisam de um âmbito)
     try:
-        df = _in_scope(lib.compute_flags(lib.contracts(), **lib.DEFAULT_PARAMS), scope)
+        # só o ano mais recente do âmbito: o Briefing mostra os últimos dias publicados
+        year = scope.ano or (lib.years_available() or [None])[0]
+        place = lib.Place(None, scope.municipio, (year,) if year else ())
+        df = _in_scope(lib.compute_flags(lib.contracts_in_scope(place), **lib.DEFAULT_PARAMS), scope)
         if df.empty:
             return 0, 0, [], None
         latest = df["publication_date"].max()
@@ -146,7 +169,7 @@ def briefing(scope: Scope, limit: int = 3) -> tuple[int, int, list[Flag], pd.Tim
 # Assistente: usa a conversa Gemini de assistant.py (troca de modelo, limites, etc.)
 # --------------------------------------------------------------------------
 def scope_text(scope: Scope) -> str:
-    parts = [f"município {scope.municipio}",
+    parts = ["todo o país (todos os concelhos)" if scope.municipio == COUNTRY else f"concelho {scope.municipio}",
              f"contratos publicados em {scope.ano}" if scope.ano else "todos os anos",
              f"tipo de procedimento «{scope.procedimento}»" if scope.procedimento else "todos os tipos de procedimento"]
     return "; ".join(parts)

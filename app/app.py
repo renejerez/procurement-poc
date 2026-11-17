@@ -1,4 +1,7 @@
-"""Contratação pública — Covilhã. Ponto de entrada da aplicação Streamlit.
+"""Contratação pública em Portugal. Ponto de entrada da aplicação Streamlit.
+
+A base de dados tem os contratos de todo o país; cada página trabalha sobre um âmbito (distrito, concelho, anos)
+escolhido na barra lateral, carregado do DuckDB já filtrado.
 
 Correr localmente:  streamlit run app/app.py
 """
@@ -6,7 +9,7 @@ import streamlit as st
 
 import lib
 
-st.set_page_config(page_title="Contratação pública na Covilhã", page_icon=":material/gavel:", layout="wide")
+st.set_page_config(page_title="Contratação pública em Portugal", page_icon=":material/gavel:", layout="wide")
 
 lib.require_db()
 
@@ -27,13 +30,22 @@ pg = st.navigation([
     st.Page("views/pipeline.py", title="Estado do pipeline", icon=":material/database:"),
 ])
 
-# Os filtros globais (Ano, Entidade, Tipo de procedimento) não aparecem no Assistente:
-# lá o âmbito escolhe-se no próprio composer.
-all_contracts = lib.contracts()
-if pg.title == "Assistente":
-    st.session_state["filtered"] = all_contracts
+# O Assistente escolhe o âmbito no próprio composer; o Estado do pipeline mostra a base inteira (só agregados SQL).
+# As outras páginas recebem os contratos do âmbito da barra lateral, já filtrados pela entidade e pelo procedimento.
+if pg.title in ("Assistente", "Estado do pipeline"):
+    st.session_state["filtered"] = None
+    st.session_state["place"] = None
 else:
-    st.session_state["filtered"] = lib.sidebar_filters(all_contracts)
+    place = lib.place_selector()
+    st.session_state["place"] = place
+    try:
+        scoped = lib.contracts_in_scope(place)
+    except lib.ScopeTooLarge as e:
+        st.warning(f"**{place.label}** tem {lib.num(e.n)} contratos, demasiados para carregar de uma vez "
+                   f"(máximo {lib.num(lib.MAX_SCOPE_ROWS)}). Escolha um distrito, um concelho ou menos anos "
+                   "na barra lateral. Para perguntas sobre todo o país, use o Assistente.")
+        st.stop()
+    st.session_state["filtered"] = lib.sidebar_filters(scoped)
 
 pg.run()
 

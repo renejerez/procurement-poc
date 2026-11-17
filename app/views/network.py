@@ -6,7 +6,8 @@ import lib
 
 st.title("Rede de relações")
 st.caption("Ligações entre entidades adjudicantes e adjudicatários, agrupadas por NIF. "
-           "A espessura da ligação é proporcional ao valor contratado.")
+           "A espessura da ligação é proporcional ao valor contratado. "
+           f"Âmbito: {st.session_state['place'].label}.")
 
 df = st.session_state["filtered"]
 if df.empty:

@@ -177,7 +177,7 @@ def scope_bar() -> ad.Scope:
     cur = ss.scope
     c1, c2, c3 = st.columns([1.1, 1, 2.2])
     with c1:
-        mun = st.selectbox("Município", opts["municipios"], key="sc_mun", label_visibility="collapsed",
+        mun = st.selectbox("Concelho", opts["municipios"], key="sc_mun", label_visibility="collapsed",
                            index=opts["municipios"].index(cur.municipio) if cur.municipio in opts["municipios"] else 0)
     with c2:
         years = opts["anos"] + [ALL_YEARS]
@@ -235,7 +235,9 @@ if not ss.messages and not ss.pending:
                     f'<span class="cp-h">Briefing</span><span class="cp-meta" style="text-align:right">'
                     f'{n_recent} contratos publicados nos últimos {ad.BRIEFING_DAYS} dias{until} · '
                     f'{n_flagged} sinalizados</span></div>', unsafe_allow_html=True)
-        if not flags:
+        if scope.municipio == ad.COUNTRY:
+            st.caption("O Briefing é calculado por concelho: escolha um concelho no âmbito acima.")
+        elif not flags:
             st.caption("Nenhum contrato recente foi sinalizado pelos indicadores.")
         for f in flags:
             st.markdown('<hr class="cp-hr">', unsafe_allow_html=True)

@@ -10,6 +10,9 @@ st.markdown(
     "**Um alerta não é prova de irregularidade**: assinala contratos que merecem uma leitura mais atenta. "
     "Esta é a primeira camada do sistema de deteção; a análise dos documentos com RAG/LLM virá depois."
 )
+st.caption(f"Âmbito: {st.session_state['place'].label}. O fracionamento e a concentração são calculados com os "
+           "contratos deste âmbito: uma entidade que também contrata fora dele pode ter valores diferentes "
+           "no país inteiro.")
 
 with st.expander("Parâmetros dos indicadores"):
     p1, p2, p3, p4 = st.columns(4)
