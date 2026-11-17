@@ -196,6 +196,34 @@ def num(x):
     return f"{int(x):,}".replace(",", ".")
 
 
+# ─────────────────────────────── NIF ───────────────────────────────
+# Pessoas singulares são publicadas pelo IMPIC sem NIF ('-'); o notebook 02 guarda-as como 'NO-NIF:<nome>'.
+NO_NIF = "sem NIF publicado"
+JUSTICE_SEARCH = "https://publicacoes.mj.pt/pesquisa.aspx"   # Portal da Justiça: atos societários, pesquisa por NIF/NIPC
+
+
+def real_nif(nif):
+    """True para um NIF publicado; False para pessoas sem NIF ('NO-NIF:…', '-', vazio)."""
+    if nif is None or (isinstance(nif, float) and pd.isna(nif)):
+        return False
+    s = str(nif).strip()
+    return bool(s.strip("- ")) and not s.startswith("NO-NIF:")
+
+
+def nif_label(nifs):
+    """NIF(s) para mostrar: 'a + b' (vários adjudicatários) mantém a ordem; sem NIF -> 'sem NIF publicado'."""
+    if nifs is None or (isinstance(nifs, float) and pd.isna(nifs)):
+        return "—"
+    return " + ".join(p.strip() if real_nif(p) else NO_NIF for p in str(nifs).split(" + "))
+
+
+def real_nifs(nifs):
+    """Lista dos NIFs publicados num campo 'a + b', sem os 'NO-NIF:…'."""
+    if nifs is None or (isinstance(nifs, float) and pd.isna(nifs)):
+        return []
+    return [p.strip() for p in str(nifs).split(" + ") if real_nif(p)]
+
+
 def style_fig(fig, height=None):
     fig.update_layout(separators=",.", margin=dict(l=10, r=10, t=40, b=10), legend_title_text="")
     if height:

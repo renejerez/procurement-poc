@@ -30,9 +30,11 @@ if only_flagged:
 
 st.caption(f"{lib.num(len(view))} contratos · {lib.eur(view['contract_price'].sum())}. Clique numa linha para ver o detalhe.")
 
-cols = ["contract_id", "publication_date", "object", "authority", "contractor", "procedure_type",
-        "contract_price", "bidders", "n_flags", "base_link"]
+cols = ["contract_id", "publication_date", "object", "authority", "authority_nif", "contractor", "contractor_nif",
+        "procedure_type", "contract_price", "bidders", "n_flags", "base_link"]
 table = view.sort_values("publication_date", ascending=False)[cols]
+table = table.assign(authority_nif=table["authority_nif"].map(lib.nif_label),
+                     contractor_nif=table["contractor_nif"].map(lib.nif_label))
 event = st.dataframe(
     table, hide_index=True, height=420, on_select="rerun", selection_mode="single-row",
     column_config={
@@ -40,7 +42,9 @@ event = st.dataframe(
         "publication_date": st.column_config.DateColumn("Publicação", format="DD/MM/YYYY"),
         "object": st.column_config.TextColumn("Objeto", width="large"),
         "authority": "Entidade adjudicante",
+        "authority_nif": "NIF adjudicante",
         "contractor": "Adjudicatário",
+        "contractor_nif": "NIF adjudicatário",
         "procedure_type": "Procedimento",
         "contract_price": st.column_config.NumberColumn("Preço contratual (€)", format="localized"),
         "bidders": st.column_config.NumberColumn("Concorrentes", format="%d"),
@@ -48,6 +52,11 @@ event = st.dataframe(
         "base_link": st.column_config.LinkColumn("BASE", display_text="abrir"),
     },
 )
+
+st.download_button(
+    f"Descarregar CSV ({lib.num(len(table))} contratos)",
+    table.drop(columns=["base_link"]).to_csv(index=False, sep=";", decimal=",", date_format="%d/%m/%Y").encode("utf-8-sig"),
+    file_name="contratos.csv", mime="text/csv")
 
 if not event.selection.rows:
     st.stop()
@@ -71,13 +80,22 @@ if flags:
 left, right = st.columns(2)
 with left:
     st.markdown("  \n".join([
-        f"**Entidade adjudicante:** {c['authority']} (NIF {c['authority_nif']})",
-        f"**Adjudicatário:** {c['contractor']} (NIF {c['contractor_nif']})",
+        f"**Entidade adjudicante:** {c['authority']} (NIF {lib.nif_label(c['authority_nif'])})",
+        f"**Adjudicatário:** {c['contractor']} (NIF {lib.nif_label(c['contractor_nif'])})",
         f"**Procedimento:** {c['procedure_type']}",
         f"**Tipo de contrato:** {c['contract_types'] or '—'}",
         f"**CPV:** {c['cpv_code'] or '—'} {c['cpv_description'] or ''}",
         f"**Fundamentação:** {c['legal_basis'] or '—'}",
     ]))
+    company_nifs = lib.real_nifs(c["contractor_nif"])
+    if company_nifs:
+        with st.popover("Procurar sócios e gerentes do adjudicatário"):
+            st.markdown(f"Os atos societários (constituição, sócios, gerentes) estão no "
+                        f"[Portal da Justiça]({lib.JUSTICE_SEARCH}). Copie o NIF, cole-o no campo **NIF/NIPC** "
+                        "e escolha o distrito.")
+            for n in company_nifs:
+                st.code(n, language=None)
+            st.caption("Só empresas: pessoas singulares não têm atos societários publicados.")
 with right:
     def d(x):
         return "—" if x != x or x is None else f"{x:%d/%m/%Y}"
@@ -99,6 +117,7 @@ competitors = lib.query("""
     WHERE p.contract_id = ? AND p.role = 'competitor' ORDER BY vencedor DESC, concorrente
 """, [cid, cid])
 if not competitors.empty:
+    competitors["nif"] = competitors["nif"].map(lib.nif_label)
     st.markdown("**Concorrentes**")
     st.dataframe(competitors, hide_index=True,
                  column_config={"concorrente": "Concorrente", "nif": "NIF", "vencedor": "Adjudicado"})

@@ -63,15 +63,19 @@ else:
 
 view = view.assign(alertas=view.apply(lambda r: " · ".join(lib.flags_for(r, params)), axis=1))
 view = view.sort_values(["n_flags", "contract_price"], ascending=False)
+view = view.assign(authority_nif=view["authority_nif"].map(lib.nif_label),
+                   contractor_nif=view["contractor_nif"].map(lib.nif_label))
 st.dataframe(
-    view[["contract_id", "publication_date", "object", "authority", "contractor", "procedure_type",
+    view[["contract_id", "publication_date", "object", "authority", "authority_nif", "contractor", "contractor_nif",
+          "procedure_type",
           "contract_price", "limit", "bidders", "n_flags", "alertas", "relacoes", "base_link"]],
     hide_index=True, height=480,
     column_config={
         "contract_id": st.column_config.NumberColumn("ID", format="%d"),
         "publication_date": st.column_config.DateColumn("Publicação", format="DD/MM/YYYY"),
         "object": st.column_config.TextColumn("Objeto", width="large"),
-        "authority": "Entidade adjudicante", "contractor": "Adjudicatário", "procedure_type": "Procedimento",
+        "authority": "Entidade adjudicante", "authority_nif": "NIF adjudicante",
+        "contractor": "Adjudicatário", "contractor_nif": "NIF adjudicatário", "procedure_type": "Procedimento",
         "contract_price": st.column_config.NumberColumn("Preço contratual (€)", format="localized"),
         "limit": st.column_config.NumberColumn("Limiar aplicável (€)", format="localized"),
         "bidders": st.column_config.NumberColumn("Concorrentes", format="%d"),

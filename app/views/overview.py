@@ -51,7 +51,12 @@ left, right = st.columns(2)
 for col, who, title in [(left, "authority", "Maiores entidades adjudicantes"), (right, "contractor", "Maiores adjudicatários")]:
     with col:
         st.subheader(title)
-        top = (df.groupby(who).agg(contratos=("contract_id", "size"), valor=("contract_price", "sum"))
+        # agrupar pelo NIF (a mesma entidade aparece com grafias diferentes); mostra o nome mais recente
+        top = (df.sort_values("publication_date")
+                 .groupby(f"{who}_nif").agg(nome=(who, "last"), contratos=("contract_id", "size"),
+                                            valor=("contract_price", "sum"))
                  .sort_values("valor", ascending=False).head(10).reset_index())
-        st.dataframe(top.rename(columns={who: "Entidade", "contratos": "Contratos", "valor": "Valor"}),
+        top["nif"] = top[f"{who}_nif"].map(lib.nif_label)
+        top = top[["nome", "nif", "contratos", "valor"]]
+        st.dataframe(top.rename(columns={"nome": "Entidade", "nif": "NIF", "contratos": "Contratos", "valor": "Valor"}),
                      hide_index=True, column_config={"Valor": lib.EURO})

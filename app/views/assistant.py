@@ -86,6 +86,51 @@ def eur(v: float) -> str:
 
 MONEY = ("preco", "preço", "price", "valor", "total", "montante", "gasto", "eur")
 
+# --------------------------------------------------------------------------
+# Limites: tamanho da pergunta e exportação CSV das consultas do assistente
+# --------------------------------------------------------------------------
+MAX_PROMPT_CHARS = 500     # perguntas mais longas (código, textos colados) não chegam ao Gemini
+CSV_MIN_ROWS = 4           # botão de CSV a partir de 4 linhas
+CSV_CONFIRM_ROWS = 10_000  # acima disto, pede confirmação antes de gerar o ficheiro
+CSV_MAX_ROWS = 100_000     # nunca exporta mais do que isto (memória do Streamlit Cloud)
+
+
+@st.cache_data(max_entries=20, show_spinner="A preparar o CSV…")
+def csv_bytes(sql: str, limit: int) -> bytes:
+    """Corre de novo a consulta do assistente, sem o limite de 100 linhas do Gemini, e devolve um CSV para o Excel
+    português (; como separador, vírgula decimal, UTF-8 com BOM). Corre localmente no DuckDB: não gasta tokens."""
+    df = assistant._cursor().execute(f"SELECT * FROM ({sql}) AS resultado LIMIT {int(limit)}").df()
+    for col in df.columns:
+        if df[col].dtype == object or pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].map(lambda v: lib.nif_label(v) if isinstance(v, str) and v.startswith("NO-NIF:") else v)
+    return df.to_csv(index=False, sep=";", decimal=",", date_format="%d/%m/%Y").encode("utf-8-sig")
+
+
+def csv_exports(msg: dict, idx: int) -> None:
+    """Um botão de CSV por consulta SQL da resposta com mais de 3 linhas (no máximo as 2 últimas)."""
+    seen, items = set(), []
+    for t in msg.get("trace") or []:
+        sql, total = t.get("sql_ok"), t.get("linhas_total")
+        if sql and sql not in seen and (total is None or total >= CSV_MIN_ROWS):
+            seen.add(sql)
+            items.append((sql, total))
+    for j, (sql, total) in enumerate(items[-2:]):
+        key = f"csv_{idx}_{j}"
+        name = f"consulta_{idx}_{j + 1}.csv"
+        if total is None:
+            st.caption("Não foi possível contar as linhas desta consulta: exportação indisponível.")
+        elif total > CSV_MAX_ROWS:
+            st.caption(f"Esta consulta devolve {lib.num(total)} linhas, acima do máximo de {lib.num(CSV_MAX_ROWS)} "
+                       "para exportar. Restrinja a pergunta (ano, entidade ou concelho).")
+        elif total > CSV_CONFIRM_ROWS:
+            st.caption(f"Esta consulta devolve {lib.num(total)} linhas. O ficheiro pode demorar e ficar grande.")
+            if st.checkbox(f"Confirmo que quero descarregar as {lib.num(total)} linhas", key=f"{key}_ok"):
+                st.download_button(f"Descarregar CSV ({lib.num(total)} linhas)", csv_bytes(sql, CSV_MAX_ROWS),
+                                   file_name=name, mime="text/csv", key=key)
+        else:
+            st.download_button(f"Descarregar CSV ({lib.num(total)} linhas)", csv_bytes(sql, CSV_CONFIRM_ROWS),
+                               file_name=name, mime="text/csv", key=key)
+
 
 def _label(col: str) -> str:
     return col.replace("_", " ").strip().capitalize()
@@ -203,7 +248,7 @@ if not ss.messages and not ss.pending:
     st.markdown('<div class="cp-q">O que quer investigar?</div>', unsafe_allow_html=True)
 
     with st.container(border=True):
-        prompt = st.chat_input(PLACEHOLDER, key="chat_start", disabled=not HAS_KEY)
+        prompt = st.chat_input(PLACEHOLDER, key="chat_start", disabled=not HAS_KEY, max_chars=MAX_PROMPT_CHARS)
         scope = scope_bar()
     ss.scope = scope
     if not HAS_KEY:
@@ -276,6 +321,7 @@ else:
         charts = [t["grafico"] for t in (msg.get("trace") or []) if t.get("grafico")]
         for j, spec in enumerate(charts[-2:]):            # no máximo os 2 últimos gráficos da resposta
             draw_chart(spec, key=f"chart_{idx}_{j}")
+        csv_exports(msg, idx)
         ev = msg.get("evidence") or []
         if ev:
             with st.expander(f"Evidência ({len(ev)})"):
@@ -309,7 +355,8 @@ else:
             else:
                 st.markdown(m["content"])
 
-    prompt = st.chat_input("Faça uma pergunta de seguimento…", key="chat_follow", disabled=not HAS_KEY)
+    prompt = st.chat_input("Faça uma pergunta de seguimento…", key="chat_follow", disabled=not HAS_KEY,
+                           max_chars=MAX_PROMPT_CHARS)
     prompt = prompt or ss.pending
     ss.pending = None
 
