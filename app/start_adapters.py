@@ -12,6 +12,7 @@ import pandas as pd
 
 import assistant
 import lib
+import usage_log
 
 BRIEFING_DAYS = 7          # "novos" = publicados nos últimos N dias, até à data de publicação mais recente
 
@@ -182,10 +183,18 @@ def ask(question: str, scope: Scope) -> Answer:
     st.session_state["trace"] = []
     message = (f"[Âmbito escolhido pelo utilizador: {scope_text(scope)}. Aplica este âmbito a totais, contagens e "
                f"listas, salvo se a pergunta indicar outro.]\n{question}")
+    import time
+    import uuid
+    session = st.session_state.setdefault("usage_session", str(uuid.uuid4()))   # uma por investigação
+    qid = usage_log.start_question(question, session_id=session, scope=scope_text(scope))
+    t0 = time.time()
     try:
-        text = assistant.send(message)
+        text = assistant.send(message, question_id=qid)
+        usage_log.finish_question(qid, "sem_resposta" if text == assistant.NO_FINAL_ANSWER else "ok",
+                                  text, time.time() - t0)
     except Exception as e:
         text = assistant.friendly_error(e)
+        usage_log.finish_question(qid, "erro", "", time.time() - t0, error=f"{type(e).__name__}: {e}")
     trace = st.session_state.get("trace", [])
     evidence = [Evidence(e["kind"], e["label"], e.get("detail", ""), e.get("link"))
                 for t in trace for e in t.get("evidencia", [])]
@@ -198,5 +207,5 @@ def ask(question: str, scope: Scope) -> Answer:
 
 def new_conversation() -> None:
     import streamlit as st
-    for k in ["chat", "chat_model", "trace"]:
+    for k in ["chat", "chat_model", "trace", "usage_session"]:
         st.session_state.pop(k, None)

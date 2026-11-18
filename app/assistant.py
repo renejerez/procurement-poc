@@ -12,11 +12,13 @@ import streamlit as st
 
 import lib
 import rag
+import usage_log
 
 DEFAULT_MODEL = "gemini-3.6-flash"
 # se o modelo escolhido estiver sobrecarregado ou lento (erro 503/504), tenta os seguintes, mantendo a conversa
 FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
 SEARCH_TIMEOUT_S = 60
+MAX_ROUNDS = 10      # pedidos ao Gemini por pergunta (antes: maximum_remote_calls=10 do ciclo automático)
 
 
 def api_key():
@@ -423,7 +425,8 @@ def new_chat(model=None, history=None):
         temperature=0.2,
         # o Gemini 3 "pensa" a nível alto por omissão, o que é lento; para escolher ferramentas e resumir basta "low"
         thinking_config=types.ThinkingConfig(thinking_level=os.environ.get("GEMINI_THINKING", "low")),
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(maximum_remote_calls=10),
+        # o ciclo das ferramentas corre em send(), para registar os tokens de cada pedido (usage_log)
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
     )
     return client.chats.create(model=model or model_name(), config=config, history=history or [])
 
@@ -445,32 +448,77 @@ def _switch_model(e):
     return _overloaded(e) or _quota(e)
 
 
-def send(message):
-    """Envia a mensagem na conversa da sessão. Se o modelo estiver sobrecarregado, passa ao seguinte."""
+TOOLS_BY_NAME = {f.__name__: f for f in TOOLS}
+
+
+def _run_tools(function_calls):
+    """Executa as ferramentas pedidas pelo Gemini e devolve as respostas no formato da API."""
+    from google.genai import types
+    parts = []
+    for fc in function_calls:
+        fn = TOOLS_BY_NAME.get(fc.name)
+        try:
+            result = fn(**dict(fc.args or {})) if fn else {"erro": f"ferramenta desconhecida: {fc.name}"}
+        except Exception as e:                       # argumentos errados, por exemplo: o modelo pode corrigir
+            result = {"erro": f"{type(e).__name__}: {e}"}
+        if not isinstance(result, dict):
+            result = {"resultado": result}
+        parts.append(types.Part.from_function_response(name=fc.name, response=result))
+    return parts
+
+
+def _chat_for(model):
+    """Conversa da sessão no modelo pedido; ao mudar de modelo, leva o histórico."""
+    chat = st.session_state.get("chat")
+    if chat is None or st.session_state.get("chat_model") != model:
+        history = chat.get_history() if chat is not None else None
+        chat = new_chat(model, history)
+        st.session_state["chat"], st.session_state["chat_model"] = chat, model
+    return chat
+
+
+def _text(response):
+    parts = (response.candidates[0].content.parts or []) if response.candidates else []
+    return "".join(p.text for p in parts if getattr(p, "text", None) and not getattr(p, "thought", False))
+
+
+def send(message, question_id=None):
+    """Envia a mensagem e corre o ciclo das ferramentas, um pedido de cada vez, registando cada pedido.
+    Se o modelo estiver sobrecarregado ou sem quota, passa ao seguinte e repete só o pedido que falhou."""
     models = models_to_try()
     current = st.session_state.get("chat_model", models[0])
-    start = models.index(current) if current in models else 0
-    for i, model in enumerate(models[start:], start):
-        chat = st.session_state.get("chat")
-        if chat is None or st.session_state.get("chat_model") != model:
-            history = chat.get_history() if chat is not None else None
-            chat = new_chat(model, history)
-            st.session_state["chat"], st.session_state["chat_model"] = chat, model
-        try:
-            response = chat.send_message(message)
-            parts = (response.candidates[0].content.parts or []) if response.candidates else []
-            text = "".join(p.text for p in parts if getattr(p, "text", None))
-            if not text:
-                _say("⚠️ o Gemini esgotou os passos sem escrever a resposta final")
-                return ("Não consegui chegar a uma resposta final (o assistente usou demasiados passos). "
-                        "Tente reformular a pergunta de forma mais concreta, ou escolha um contrato em foco.")
-            return text
-        except Exception as e:
-            if _switch_model(e) and i + 1 < len(models):
-                reason = "atingiu o limite do plano gratuito" if _quota(e) else "não respondeu a tempo ou está sobrecarregado"
-                _say(f"⚠️ {model} {reason}; a tentar {models[i + 1]}")
-                continue
-            raise
+    i = models.index(current) if current in models else 0
+    pending = message                                # o que falta enviar: a pergunta ou os resultados das ferramentas
+    for rnd in range(1, MAX_ROUNDS + 1):
+        while True:
+            model = models[i]
+            chat = _chat_for(model)
+            t0 = time.time()
+            try:
+                response = chat.send_message(pending)
+                usage_log.log_call(question_id, rnd, model, time.time() - t0, response=response)
+                break
+            except Exception as e:
+                usage_log.log_call(question_id, rnd, model, time.time() - t0, error=f"{type(e).__name__}: {e}")
+                if _switch_model(e) and i + 1 < len(models):
+                    reason = "atingiu o limite do plano gratuito" if _quota(e) else "não respondeu a tempo ou está sobrecarregado"
+                    _say(f"⚠️ {model} {reason}; a tentar {models[i + 1]}")
+                    i += 1
+                    continue
+                raise
+        calls = response.function_calls or []
+        if not calls:
+            text = _text(response)
+            if text:
+                return text
+            break
+        pending = _run_tools(calls)
+    _say("⚠️ o Gemini esgotou os passos sem escrever a resposta final")
+    return NO_FINAL_ANSWER
+
+
+NO_FINAL_ANSWER = ("Não consegui chegar a uma resposta final (o assistente usou demasiados passos). "
+                   "Tente reformular a pergunta de forma mais concreta, ou escolha um contrato em foco.")
 
 
 def friendly_error(e):
